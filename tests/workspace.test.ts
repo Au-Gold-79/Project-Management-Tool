@@ -1,0 +1,80 @@
+import { beforeAll, afterAll, test, expect } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
+import { fresh, report } from "../packages/web/src/shared/model";
+
+const temp = await mkdtemp(resolve(tmpdir(), "meridian-test-"));
+process.env.APP_DATA_DIR = temp;
+let service: typeof import("../packages/web/src/api/services/workspace");
+beforeAll(async () => {
+  const result = Bun.spawnSync(["bun", "scripts/setup.ts"], { env: { ...process.env, APP_DATA_DIR: temp } });
+  expect(result.exitCode).toBe(0);
+  service = await import("../packages/web/src/api/services/workspace");
+});
+afterAll(async () => { const { sqlite } = await import("../packages/web/src/api/database/local"); sqlite.close(); await rm(temp, { recursive: true, force: true }); });
+
+test("project CRUD, valid contacts, assignment and persistence", async () => {
+  const member = await service.save("members", fresh({ name: "Test Member", email: "member@example.com" }));
+  const project = await service.save("projects", fresh({ name: "Test Project", status: "planning", memberIds: [member.id] }));
+  const task = await service.save("tasks", fresh({ name: "Assigned task", projectId: project.id, assigneeId: member.id }));
+  expect((await service.get("tasks", task.id)).assigneeId).toBe(member.id);
+  const updated = await service.save("projects", { ...project, name: "Updated Project" });
+  expect(updated.createdAt).toBe(project.createdAt);
+  const setup = Bun.spawnSync(["bun", "scripts/setup.ts"], { env: { ...process.env, APP_DATA_DIR: temp } });
+  expect(setup.exitCode).toBe(0);
+  expect((await service.get("projects", project.id)).name).toBe("Updated Project");
+  await service.remove("members", member.id);
+  expect((await service.get("tasks", task.id)).assigneeId).toBe("");
+  expect((await service.get("projects", project.id)).memberIds).toEqual([]);
+});
+test("reject invalid status, dates, budgets, empty names and foreign relations", async () => {
+  await expect(service.save("projects", fresh({ name: "Bad", status: "nonsense" }))).rejects.toThrow("Invalid project status");
+  await expect(service.save("projects", fresh({ name: "Bad", status: "planning", startDate: "2026-12-20", dueDate: "2026-12-10" }))).rejects.toThrow("Start date");
+  await expect(service.save("projects", fresh({ name: "Bad", status: "planning", dueDate: "2026-02-30" }))).rejects.toThrow("valid date");
+  expect(() => fresh({ budget: -1 })).toThrow();
+  await expect(service.save("members", fresh({ name: " " }))).rejects.toThrow("name");
+  await expect(service.save("members", fresh({ name: "Bad email", email: "not-an-email" }))).rejects.toThrow("email");
+  await expect(service.save("tasks", fresh({ name: "Missing project", projectId: crypto.randomUUID() }))).rejects.toThrow("no longer exists");
+});
+test("Kanban status, comments, milestones, reports and elapsed timer", async () => {
+  const project = await service.save("projects", fresh({ name: "Reporting", status: "in-progress", budget: 400 }));
+  const task = await service.save("tasks", fresh({ name: "Timed task", projectId: project.id, dueDate: "2020-01-01", estimatedHours: 5 }));
+  const comment = await service.save("comments", fresh({ projectId: project.id, taskId: task.id, content: "@Test Member Hello" }));
+  expect((await service.get("comments", comment.id)).content).toBe("@Test Member Hello");
+  await expect(service.save("comments", fresh({ projectId: project.id, taskId: task.id, content: "" }))).rejects.toThrow("empty");
+  const milestone = await service.save("milestones", fresh({ name: "Launch", projectId: project.id, completed: true }));
+  expect(milestone.completed).toBe(true);
+  await service.save("time", fresh({ projectId: project.id, taskId: task.id, date: "2026-10-12", hours: 2 }));
+  await service.startTimer(task.id);
+  await expect(service.startTimer(task.id)).rejects.toThrow("running timer");
+  await service.stopTimer(task.id);
+  let summary = report(await service.workspace(), project.id);
+  expect(summary.overdue).toBe(1); expect(summary.estimated).toBe(5); expect(summary.actual).toBeGreaterThan(2); expect(summary.budget).toBe(400);
+  await service.save("tasks", { ...await service.get("tasks", task.id), status: "done" });
+  summary = report(await service.workspace(), project.id);
+  expect(summary.progress).toBe(100); expect(summary.overdue).toBe(0);
+  await expect(service.startTimer(task.id)).rejects.toThrow("Reopen");
+});
+test("file roundtrip, unsafe filenames, limits, downloads and cascading deletion", async () => {
+  const project = await service.save("projects", fresh({ name: "Files", status: "planning" }));
+  const task = await service.save("tasks", fresh({ name: "Files task", projectId: project.id }));
+  const file = await service.upload({ projectId: project.id, taskId: task.id, name: "../../test.txt", data: Buffer.from("safe content").toString("base64"), mime: "text/plain" });
+  expect(file.name).not.toContain("/");
+  const path = resolve(temp, "uploads", file.fileKey);
+  expect(await Bun.file(path).text()).toBe("safe content");
+  await expect(service.upload({ projectId: project.id, taskId: "", name: "empty", data: "", mime: "" })).rejects.toThrow("nonempty");
+  await expect(service.upload({ projectId: project.id, taskId: "", name: "bad", data: "$bad", mime: "" })).rejects.toThrow("Invalid file");
+  await expect(service.upload({ projectId: project.id, taskId: "", name: "big", data: "a".repeat(28_000_001), mime: "" })).rejects.toThrow("20 MB");
+  const other = await service.save("projects", fresh({ name: "Other", status: "planning" }));
+  await expect(service.save("comments", fresh({ projectId: other.id, taskId: task.id, content: "Wrong project" }))).rejects.toThrow("different project");
+  const app = (await import("../packages/web/src/api")).default;
+  const response = await app.request(`/api/files/${file.id}`);
+  expect(response.status).toBe(200); expect(response.headers.get("Content-Type")).toBe("application/octet-stream"); expect(await response.text()).toBe("safe content");
+  expect((await app.request("/api/files/not-a-uuid")).status).toBe(400);
+  expect((await app.request(`/api/files/${crypto.randomUUID()}`)).status).toBe(404);
+  await service.remove("projects", project.id);
+  expect(await Bun.file(path).exists()).toBe(false);
+  await expect(service.get("tasks", task.id)).rejects.toThrow("no longer exists");
+  expect((await service.list("files")).some(f => f.id === file.id)).toBe(false);
+});
