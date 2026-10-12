@@ -18,6 +18,10 @@ Tests run in a Debian Linux sandbox using Bun 1.4.2 and installed Google Chrome.
 - Extracted ZIP local launcher passed real-browser empty-workspace, project creation and reload checks. Data remained after a server restart. Cross-origin browser access was rejected with HTTP 403.
 - Repeat setup preserved existing records. The exact Windows source/scripts were tested for portable paths in Linux; this is not Windows certification.
 
+## GitHub publication
+- Source published successfully to the existing public repository `Au-Gold-79/Project-Management-Tool` on `main`, preserving its initial history without force-pushing.
+- The initial token returned HTTP 403. After replacement, the push succeeded and remote read-back confirmed the commit, required application files, public visibility and absence of environment files, databases, uploads and node_modules.
+
 ## Scope and limitations
 - Browser automation operates against a fictional sandbox workspace and removes only its own temporary test project.
 - The Windows `.bat` launchers use quoted paths, native `cd /d`, Bun availability checks and explicit error handling; they have not been executed on Windows.
